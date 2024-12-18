@@ -1,10 +1,12 @@
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
 import googlemaps
 import logging
 import asyncio
-import requests
+import aiohttp
 from config import TELEGRAM_TOKEN, GOOGLE_MAPS_API_KEY, OPENWEATHER_API_KEY
 
 # Flask-приложение
@@ -20,18 +22,73 @@ gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 # Создаем Telegram приложение
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+
 # Словари для хранения данных пользователей
 user_state = {}
 user_history = {}
 
-# Обработчики команд
+# Асинхронные запросы с использованием aiohttp
+async def fetch_weather(lat, lon):
+    try:
+        async with aiohttp.ClientSession() as session:
+            weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+            async with session.get(weather_url) as response:
+                response_data = await response.json()
+                return {
+                    "description": response_data["weather"][0]["description"],
+                    "temp": response_data["main"]["temp"]
+                }
+    except Exception as e:
+        logging.error(f"Ошибка запроса к OpenWeather: {e}")
+        return None
+    
+def create_navigation_buttons():
+    # Определяем кнопки
+    button_start = InlineKeyboardButton("Начать новый маршрут", callback_data="start_new_route")
+    button_history = InlineKeyboardButton("История запросов", callback_data="show_history")
+    button_cancel = InlineKeyboardButton("Отменить запрос", callback_data="cancel_request")
+    
+    # Создаем клавиатуру
+    keyboard = InlineKeyboardMarkup([[button_start, button_history], [button_cancel]])
+    
+    return keyboard
+
+# Сначала определяем функцию обработчика
+async def handle_button_click(update: Update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # Обработка нажатия кнопки "Начать новый маршрут"
+    if query.data == "start_new_route":
+        user_state[user_id] = {"step": "origin"}  # Сбрасываем состояние
+        await query.answer()  # Ответ на запрос
+        await query.edit_message_text("Отправьте мне пункт отправления для нового маршрута.")
+
+    # Обработка нажатия кнопки "История запросов"
+    elif query.data == "show_history":
+        await history(update, context)  # Показать историю запросов
+
+    # Обработка нажатия кнопки "Отменить запрос"
+    elif query.data == "cancel_request":
+        if user_id in user_state:
+            del user_state[user_id]  # Отменяем запрос
+            await query.answer()  # Ответ на запрос
+            await query.edit_message_text("Ваш запрос был отменен.")
+
+# Теперь добавляем обработчик в приложение
+application.add_handler(CallbackQueryHandler(handle_button_click))  # Обработчик для нажатий на кнопки
+
+
+
 async def start(update: Update, context):
     user_id = update.message.from_user.id
     user_state[user_id] = {"step": "origin"}  # Инициализируем состояние
     await update.message.reply_text(
         "Привет! Я помогу вам с маршрутом в Астане и предупрежу о погодных условиях.\n"
-        "Для начала отправьте мне пункт отправления."
+        "Для начала отправьте мне пункт отправления.",
+        reply_markup=create_navigation_buttons()  # Отправляем клавиатуру с кнопками
     )
+
 
 async def handle_message(update: Update, context):
     user_id = update.message.from_user.id
@@ -53,6 +110,7 @@ async def handle_message(update: Update, context):
 
 async def calculate_route(update: Update, context, user_id):
     try:
+        # Получение начальной и конечной точки
         origin_input = user_state[user_id]["origin"]
         destination_input = user_state[user_id]["destination"]
 
@@ -65,47 +123,129 @@ async def calculate_route(update: Update, context, user_id):
             )
             return
 
-        result = gmaps.directions(
-            origin=origin["formatted_address"],
-            destination=destination["formatted_address"],
-            mode="driving",
-            departure_time="now",
-            traffic_model="best_guess"
-        )
-        if result:
-            route = result[0]['legs'][0]
-            distance = route['distance']['text']
-            duration = route['duration']['text']
-            traffic = route['duration_in_traffic']['text']
-            gmaps_link = f"https://www.google.com/maps/dir/?api=1&origin={origin['formatted_address'].replace(' ', '+')}&destination={destination['formatted_address'].replace(' ', '+')}&travelmode=driving"
+        # Запрос маршрутов для разных видов транспорта
+        modes = ["driving", "walking", "transit"]
+        routes = {}
 
-            if user_id not in user_history:
-                user_history[user_id] = []
-            user_history[user_id].append({
+        for mode in modes:
+            directions_params = {
                 "origin": origin["formatted_address"],
                 "destination": destination["formatted_address"],
-                "distance": distance,
-                "duration": duration,
-                "traffic": traffic
-            })
+                "mode": mode,
+                "departure_time": "now",
+                "traffic_model": "best_guess",
+            }
 
-            weather_conditions = await get_weather_conditions(route)
-            warnings = generate_weather_warnings(weather_conditions)
-            traffic_recommendations = generate_traffic_recommendations(route)
+            result = gmaps.directions(**directions_params)
+            if result:
+                routes[mode] = result[0]['legs'][0]
 
-            response = (f"Маршрут от {origin['formatted_address']} до {destination['formatted_address']}:\n"
-                        f"- Расстояние: {distance}\n"
-                        f"- Время без пробок: {duration}\n"
-                        f"- Время с учетом пробок: {traffic}\n\n"
-                        f"[Посмотреть маршрут на карте]({gmaps_link})\n\n"
-                        f"{warnings}\n\n"
-                        f"{traffic_recommendations}")
-            await update.message.reply_markdown(response)
-        else:
+        if not routes:
             await update.message.reply_text("Не удалось найти маршрут. Проверьте адреса.")
+            return
+
+        # Извлечение данных для каждого вида транспорта
+        driving = routes.get("driving")
+        walking = routes.get("walking")
+        transit = routes.get("transit")
+
+        # Получение погодных условий для начальной и конечной точки
+        weather_conditions = await get_weather_conditions(driving or walking or transit)
+        weather_warnings = generate_weather_warnings(weather_conditions)
+
+        # Анализ дорожной обстановки
+        traffic_recommendations = generate_traffic_recommendations(driving) if driving else "Дорожная обстановка не анализировалась."
+
+        # Определение самого быстрого маршрута
+        travel_times = {}
+        if driving:
+            travel_times["driving"] = driving['duration']['value']
+        if walking:
+            travel_times["walking"] = walking['duration']['value']
+        if transit:
+            travel_times["transit"] = transit['duration']['value']
+
+        fastest_mode = min(travel_times, key=travel_times.get)
+        fastest_time = travel_times[fastest_mode]
+
+        # Сохранение в историю
+        if user_id not in user_history:
+            user_history[user_id] = []
+        user_history[user_id].append({
+            "origin": origin["formatted_address"],
+            "destination": destination["formatted_address"],
+            "distance": driving["distance"]["text"] if driving else "N/A",
+            "duration": driving["duration"]["text"] if driving else "N/A",
+            "traffic": driving.get("duration_in_traffic", {}).get("text", "N/A") if driving else "N/A",
+            "weather": weather_conditions,
+        })
+
+        # Формирование ответа
+        response = f"Оптимальные маршруты от {origin['formatted_address']} до {destination['formatted_address']}:\n\n"
+
+        if driving:
+            traffic = driving.get('duration_in_traffic', {}).get('text', 'неизвестно')
+            driving_link = f"https://www.google.com/maps/dir/?api=1&origin={origin['formatted_address'].replace(' ', '+')}&destination={destination['formatted_address'].replace(' ', '+')}&travelmode=driving"
+            response += (f"🚗 На автомобиле:\n"
+                         f"- Расстояние: {driving['distance']['text']}\n"
+                         f"- Время: {driving['duration']['text']}\n"
+                         f"- С учетом пробок: {traffic}\n"
+                         f"[Посмотреть маршрут в Google Maps]({driving_link})\n\n")
+
+        if walking:
+            walking_link = f"https://www.google.com/maps/dir/?api=1&origin={origin['formatted_address'].replace(' ', '+')}&destination={destination['formatted_address'].replace(' ', '+')}&travelmode=walking"
+            response += (f"🚶 Пешком:\n"
+                         f"- Расстояние: {walking['distance']['text']}\n"
+                         f"- Время: {walking['duration']['text']}\n"
+                         f"[Посмотреть маршрут в Google Maps]({walking_link})\n\n")
+
+        if transit:
+            transit_details = transit['steps'][0].get('transit_details', {})
+            transit_link = f"https://www.google.com/maps/dir/?api=1&origin={origin['formatted_address'].replace(' ', '+')}&destination={destination['formatted_address'].replace(' ', '+')}&travelmode=transit"
+            if transit_details:
+                line_name = transit_details['line']['short_name']
+                departure_stop = transit_details['departure_stop']['name']
+                arrival_stop = transit_details['arrival_stop']['name']
+                response += (f"🚌 На автобусе:\n"
+                             f"- Маршрут: {line_name}\n"
+                             f"- Остановка отправления: {departure_stop}\n"
+                             f"- Остановка прибытия: {arrival_stop}\n"
+                             f"- Время в пути: {transit['duration']['text']}\n"
+                             f"[Посмотреть маршрут в Google Maps]({transit_link})\n\n")
+            else:
+                response += (f"🚌 На общественном транспорте:\n"
+                             f"- Время в пути: {transit['duration']['text']}\n"
+                             f"[Посмотреть маршрут в Google Maps]({transit_link})\n\n")
+
+        # Указание самого быстрого способа
+        mode_names = {
+            "driving": "на автомобиле",
+            "walking": "пешком",
+            "transit": "на общественном транспорте"
+        }
+        response += f"✨ Самый быстрый способ добраться: {mode_names[fastest_mode]} ({fastest_time // 60} мин).\n\n"
+
+        # Добавление погодных условий и рекомендаций
+        response += f"🌤 Погодные условия:\n{weather_warnings}\n\n"
+        response += f"🚦 Рекомендации по дорожной обстановке:\n{traffic_recommendations}\n"
+
+        await update.message.reply_markdown(response)
     except Exception as e:
         logging.error(f"Ошибка при расчете маршрута: {e}")
         await update.message.reply_text("Произошла ошибка при обработке вашего запроса.")
+
+
+# Команда для очистки истории
+async def clear_history(update: Update, context):
+    user_id = update.message.from_user.id
+    if user_id in user_history:
+        user_history[user_id] = []
+        await update.message.reply_text("Ваша история запросов была очищена.")
+    else:
+        await update.message.reply_text("У вас нет сохраненной истории.")
+
+# Регистрация новой команды
+application.add_handler(CommandHandler("clearhistory", clear_history))
 
 async def get_weather_conditions(route):
     try:
@@ -120,16 +260,24 @@ async def get_weather_conditions(route):
         logging.error(f"Ошибка получения погодных данных: {e}")
         return {}
 
-async def fetch_weather(lat, lon):
+async def normalize_address(address):
     try:
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        response = requests.get(weather_url).json()
-        return {
-            "description": response["weather"][0]["description"],
-            "temp": response["main"]["temp"]
-        }
+        geocode_result = gmaps.geocode(address)
+        if geocode_result:
+            formatted_address = geocode_result[0]["formatted_address"]
+            location = geocode_result[0]["geometry"]["location"]
+
+            if "Astana" not in formatted_address and "Астана" not in formatted_address:
+                return None
+
+            return {
+                "formatted_address": formatted_address,
+                "location": location
+            }
+        else:
+            return None
     except Exception as e:
-        logging.error(f"Ошибка запроса к OpenWeather: {e}")
+        logging.error(f"Ошибка геокодирования адреса '{address}': {e}")
         return None
 
 def generate_weather_warnings(weather_conditions):
@@ -170,35 +318,22 @@ async def history(update: Update, context):
             response += (f"{idx}. От {entry['origin']} до {entry['destination']}:\n"
                          f"   - Расстояние: {entry['distance']}\n"
                          f"   - Время без пробок: {entry['duration']}\n"
-                         f"   - Время с пробками: {entry['traffic']}\n\n")
+                         f"   - Время с учетом пробок: {entry['traffic']}\n")
+        await update.message.reply_text(response)
     else:
-        response = "История запросов пуста."
-    await update.message.reply_text(response)
+        await update.message.reply_text("У вас нет истории маршрутов.")
 
-async def normalize_address(address):
-    try:
-        geocode_result = gmaps.geocode(address)
-        if geocode_result:
-            formatted_address = geocode_result[0]["formatted_address"]
-            location = geocode_result[0]["geometry"]["location"]
+async def cancel(update: Update, context):
+    user_id = update.message.from_user.id
+    if user_id in user_state:
+        del user_state[user_id]
+        await update.message.reply_text("Ваш запрос был отменен.")
 
-            if "Astana" not in formatted_address and "Астана" not in formatted_address:
-                return None
-
-            return {
-                "formatted_address": formatted_address,
-                "location": location
-            }
-        else:
-            return None
-    except Exception as e:
-        logging.error(f"Ошибка геокодирования адреса '{address}': {e}")
-        return None
-
-# Добавляем Handlers
+# Регистрация обработчиков
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(CommandHandler("history", history))
+application.add_handler(CommandHandler("cancel", cancel))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 @app.route("/")
 def index():
